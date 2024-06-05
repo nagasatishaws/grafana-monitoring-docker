@@ -1,0 +1,215 @@
+version: "3"
+
+networks:
+  loki:
+
+services:
+  loki:
+    image: grafana/loki:latest
+    container_name: loki-container
+    restart: always
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - loki
+
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/dashboard.yaml:/etc/grafana/provisioning/dashboards/main.yaml
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./provisioning/datasources:/etc/grafana/provisioning/datasources
+#      - grafana_data:/var/lib/grafana
+    environment:
+      - "GF_AUTH_DISABLE_LOGIN_FORM=false"
+      - "GF_AUTH_ANONYMOUS_ENABLED=false"
+      - "GF_AUTH_ANONYMOUS_ORG_ROLE=Admin"
+    depends_on:
+      - influxdb
+      - loki
+    networks:
+      - loki
+
+  influxdb:
+    image: influxdb:2.0
+    container_name: influxdb
+    restart: always
+    environment:
+
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_BUCKET=thecloudshepherd-bucket
+      - DOCKER_INFLUXDB_INIT_USERNAME=thecloudshepherd
+      - DOCKER_INFLUXDB_INIT_PASSWORD=thecloudshepherd
+      - DOCKER_INFLUXDB_INIT_ORG=thecloudshepherd-org
+
+    ports:
+      - '8086:8086'
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+
+  telegraf:
+    image: telegraf
+    container_name: telegraf
+    user: root
+    restart: always
+    entrypoint: /bin/bash -c "chmod 777 /var/run/docker.sock && /entrypoint.sh telegraf"
+    volumes:
+      - ./telegraph/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/hostfs:ro
+    environment:
+      - HOST_ETC=/hostfs/etc
+      - HOST_PROC=/hostfs/proc
+      - HOST_SYS=/hostfs/sys
+      - HOST_VAR=/hostfs/var
+      - HOST_RUN=/hostfs/run
+      - HOST_MOUNT_PREFIX=/hostfs
+
+
+  promtail:
+    image: grafana/promtail:2.8.0
+    container_name: promtail
+    restart: always
+    volumes:
+      - ./promtail-local-config.yaml:/etc/promtail/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yaml
+    networks:
+      - loki
+
+  flog:
+    image: mingrammer/flog
+    restart: always
+    command: -f json -d 1s -l
+    networks:
+      - loki
+      
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:0.76.1
+    container_name: open-telemetry
+    deploy:
+      resources:
+        limits:
+          memory: 125M
+    restart: unless-stopped
+    command: [ "--config=/etc/otelcol-config.yaml" ]
+    volumes:
+      - ./otel-config.yaml:/etc/otelcol-config.yaml
+    ports:
+      - "3500:3500" # loki receiver HTTP
+    networks:
+      - loki
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    restart: always
+    volumes:
+      - "./prometheus.yml:/etc/prometheus/prometheus.yml"
+      - "./dead-mans-snitch-rule.yml:/etc/prometheus/dead-mans-snitch-rule.yml"
+      - "./linuxmetrics-alerts.yml:/etc/prometheus/linuxmetrics-alerts.yml"
+      - "./redis-server/redis-rules.yml:/etc/prometheus/redis-rules.yml"
+    networks:
+      - loki
+    ports:
+      - 9090:9090
+    depends_on:
+      - cadvisor
+      - blackbox   
+
+
+  prometheus-msteams:
+    image: docker.io/bzon/prometheus-msteams:v1.1.4
+    container_name: prometheus-msteams
+    restart: unless-stopped
+    environment:
+        - TEAMS_INCOMING_WEBHOOK_URL=https://akriviain.webhook.office.com/webhookb2/886502c3-dcb7-4b78-acf9-96502832321e@4fc212ce-8457-47f8-8d9c-99da66c69cb7/IncomingWebhook/123f331908d8482c9300a939406cecd1/cf01ffa2-6bd2-4c15-878e-2a598ad09356
+        - TEAMS_REQUEST_URI=alertmanager
+    expose:
+      - 2000
+    networks:
+      - loki
+
+
+  pushgateway:
+    image: prom/pushgateway
+    container_name: pushgateway
+    restart: unless-stopped
+    expose:
+      - 9091
+    ports:
+      - "9091:9091"
+    networks:
+      - loki
+    labels:
+      org.label-schema.group: "monitoring"
+
+  node-exporter:
+    image: prom/node-exporter
+    networks:
+      - loki
+    ports:
+      - 9100:9100 
+  alert-manager:
+    image: prom/alertmanager
+    container_name: alert-manager
+    restart: always
+    volumes:
+      - "./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml"
+    networks:
+      - loki
+    ports:
+      - 9093:9093
+
+  blackbox:
+    image: prom/blackbox-exporter:latest
+    container_name: web-apis
+    restart: always
+    ports:
+    - 9115:9115
+    command:
+    - --config.file=/etc/blackbox/blackbox.yml
+    volumes:
+    - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml
+    networks:
+      - loki
+
+  cadvisor:
+    container_name: cadvisor
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes: 
+      - "/:/rootfs"
+      - "/var/run:/var/run"
+      - "/sys:/sys"
+      - "/var/lib/docker/:/var/lib/docker"
+      - "/dev/disk/:/dev/disk"
+    networks:
+      - loki
+
+    
+  nginx:
+    image: nginx:latest
+    restart: always
+    container_name: grafana-proxy
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./certs:/etc/nginx/certs
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - grafana
+    networks:
+      - loki 
+volumes:
+  grafana-storage:
+  influxdb_data:
+ # grafana_data:
